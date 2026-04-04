@@ -71,6 +71,13 @@ bash scripts/scars_dinov2.sh
 
 You may find the trained model weights in the following links: [here](https://drive.google.com/drive/folders/1K0rx6UebdUNfpFxm33CjQGEzwGit0eoD?usp=sharing). We plan to upload all model weights for both DINOv1 and DINOv2 shortly after the New Year holiday, due to ongoing checkpoint recovery and consolidation across multiple servers.
 
+## Acknowledgement
+
+The hierarchy used in this project is adapted from *Your “Flamingo” is My “Bird”: Fine-Grained, or Not* (CVPR 2021 Oral).  
+We thank the authors for publicly releasing the hierarchical labels and related resources.
+
+Label names are available at:  
+https://github.com/PRIS-CV/Fine-Grained-or-Not/tree/main
 
 ## Citing this work
 <span id="jump"></span>
