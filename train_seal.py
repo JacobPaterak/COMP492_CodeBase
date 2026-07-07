@@ -15,10 +15,12 @@ from data.get_datasets import get_datasets, get_class_splits, get_datasets_v2
 
 from util.general_utils import AverageMeter, init_experiment
 from util.cluster_and_log_utils import log_accs_from_preds
-from config import exp_root,dino_pretrain_path, dinov2_pretrain_path
+from config import exp_root,dino_pretrain_path, dinov2_pretrain_path, aircraft_root
 from model import DINOHead, info_nce_logits, SupConLoss, DistillLoss, ContrastiveLearningViewGenerator, get_params_groups, vit_threeHeads_v2, vit_twoHeads_v2, info_nce_logits_smooth
 import vision_transformer as vits
 import vision_transformers_v2 as vits_v2
+from clip_backbone import build_clip_backbone
+from text_align import build_text_prototypes, image_text_align_loss, load_pseudo_text_prototypes, pseudo_text_align_loss
 import gc
 from birds_category import trees as birds_category_list
 from birds_category import get_order_family_target as get_birds_order_family_target
@@ -92,6 +94,33 @@ def hierarchical_similarity(f_order, f_family, f_species, alpha=0.6, beta=0.3, g
 
     return sim_final_1, sim_final_2, sim_final_3
 
+
+
+def get_known_class_names(args):
+    """
+    Returns known-class display names ordered to match sorted(args.train_classes),
+    i.e. row i is the name of the class at local index i (see args.known_id_lut
+    in __main__, which maps global dataset class ids to this same local index).
+
+    Currently only implemented for the plain 'aircraft' (variant-level) task:
+    reads FGVC-Aircraft's own images_variant_trainval.txt and reproduces the
+    exact class-id ordering FGVCAircraft.find_classes() uses (np.unique over
+    the raw label strings), so indices line up with args.train_classes without
+    needing to instantiate the full dataset.
+    """
+    if args.dataset_name == 'aircraft':
+        classes_file = os.path.join(aircraft_root, 'data', 'images_variant_trainval.txt')
+        targets = []
+        with open(classes_file, 'r') as f:
+            for line in f:
+                split_line = line.split(' ')
+                targets.append(' '.join(split_line[1:]).strip())
+        all_names = np.unique(targets)  # class id i -> all_names[i]
+    else:
+        raise NotImplementedError(f'get_known_class_names not implemented for dataset_name={args.dataset_name}')
+
+    known_sorted = sorted(args.train_classes)
+    return [all_names[i] for i in known_sorted]
 
 
 def set_random_seed(seed: int) -> None:
@@ -197,6 +226,14 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args, get
         consistency_loss_2_recorder = AverageMeter()
         
         train_acc_record = AverageMeter()
+
+        if (getattr(args, 'vit_clip', False) and args.pseudo_align_weight > 0
+                and args.pseudo_refresh_epochs > 0 and epoch > 0
+                and epoch % args.pseudo_refresh_epochs == 0
+                and os.path.exists(args.pseudo_names_path)):
+            args.pseudo_proto, args.pseudo_valid = load_pseudo_text_prototypes(
+                args.clip_model, args.pseudo_names_path, args.num_species, args.device)
+            args.logger.info(f'[epoch {epoch}] reloaded pseudo text prototypes from {args.pseudo_names_path}')
 
         student.train()
         
@@ -339,10 +376,57 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args, get
                 
                 
                 pstr += f'kl_loss_family_order: {kl_loss_family_order.item():.4f} '
-                if args.dataset_name not in two_level_datasets:  
+                if args.dataset_name not in two_level_datasets:
                     pstr += f'kl_loss_species_family: {kl_loss_species_family.item():.4f} '
-            
-      
+
+                # ----------------------------------------------------------------
+                # CLIP image-text alignment (Stage 1: labeled, Stage 2: pseudo-text)
+                # Both gated behind their weight args, which default to 0.0, so the
+                # baseline (vit_dino / vit_dino_v2, or vit_clip with weights at 0.0)
+                # runs bit-for-bit identical to before -- no extra backbone forward
+                # passes are issued, so no extra RNG (dropout) is consumed either.
+                # ----------------------------------------------------------------
+                vit_clip = getattr(args, 'vit_clip', False)
+                if vit_clip and (args.align_weight > 0 or
+                                  (args.pseudo_align_weight > 0 and args.pseudo_proto is not None)):
+                    img_views = images.chunk(2, dim=0)
+
+                if vit_clip and args.align_weight > 0:
+                    labeled_images = torch.cat([v[mask_lab] for v in img_views], dim=0)
+                    labeled_targets = torch.cat([class_labels[mask_lab] for _ in range(2)], dim=0)
+                    local_labels = args.known_id_lut[labeled_targets]
+                    _, img_proj = student.module.backbone(labeled_images, return_proj=True)
+                    align_loss = image_text_align_loss(img_proj, local_labels, args.text_emb)
+                    loss += args.align_weight * align_loss
+                    pstr += f'align_loss: {align_loss.item():.4f} '
+
+                    if args.debug and epoch == 0 and batch_idx == 0:
+                        with torch.no_grad():
+                            sample_n = min(5, img_proj.size(0))
+                            sims = F.normalize(img_proj[:sample_n], dim=-1) @ args.text_emb.t()
+                            args.logger.info(f'[debug] image->text similarity (first {sample_n} labeled samples):')
+                            for i in range(sample_n):
+                                true_idx = local_labels[i].item()
+                                pred_idx = sims[i].argmax().item()
+                                true_name = args.known_class_names[true_idx]
+                                pred_name = args.known_class_names[pred_idx]
+                                args.logger.info(
+                                    f'  sample {i}: true={true_name!r} top1_pred={pred_name!r} '
+                                    f'top1_sim={sims[i, pred_idx].item():.4f} true_sim={sims[i, true_idx].item():.4f}')
+
+                if vit_clip and args.pseudo_align_weight > 0 and args.pseudo_proto is not None:
+                    unlab_images = torch.cat([v[~mask_lab] for v in img_views], dim=0)
+                    species_chunks = species_out.chunk(2, dim=0)
+                    unlab_cluster_logits = torch.cat([c[~mask_lab] for c in species_chunks], dim=0)
+                    unlab_cluster_probs = F.softmax(unlab_cluster_logits, dim=-1)
+                    unlab_cluster_conf, unlab_cluster_ids = unlab_cluster_probs.max(dim=-1)
+                    _, unlab_img_proj = student.module.backbone(unlab_images, return_proj=True)
+                    pseudo_loss = pseudo_text_align_loss(
+                        unlab_img_proj, unlab_cluster_ids, unlab_cluster_conf,
+                        args.pseudo_proto, args.pseudo_valid, conf_thresh=args.conf_thresh)
+                    loss += args.pseudo_align_weight * pseudo_loss
+                    pstr += f'pseudo_align_loss: {pseudo_loss.item():.4f} '
+
             loss_record.update(loss.item(), class_labels.size(0))
             optimizer.zero_grad()
             if fp16_scaler is None:
@@ -572,8 +656,26 @@ if __name__ == "__main__":
     parser.add_argument('--exp_name', default=None, type=str)
     
     parser.add_argument('--random_seed', default=666, type=int)
-    parser.add_argument('--model_name', default='vit_dino', type=str)
-    
+    parser.add_argument('--model_name', default='vit_dino', type=str, help='options: vit_dino, vit_dino_v2, vit_clip')
+
+    # ----------------------
+    # CLIP TEXT ALIGNMENT (all default to off; baseline is unchanged at defaults)
+    # ----------------------
+    parser.add_argument('--clip_model_name', type=str, default='openai/clip-vit-base-patch16',
+                         help='HuggingFace CLIP checkpoint used when --model_name vit_clip')
+    parser.add_argument('--align_weight', type=float, default=0.0,
+                         help='Stage 1: weight for labeled image<->known-class-text alignment loss')
+    parser.add_argument('--pseudo_names_path', type=str, default='',
+                         help='Stage 2: path to offline cluster_id->name JSON cache (see make_pseudo_names.py)')
+    parser.add_argument('--pseudo_align_weight', type=float, default=0.0,
+                         help='Stage 2: weight for unlabeled image<->pseudo-cluster-text alignment loss')
+    parser.add_argument('--conf_thresh', type=float, default=0.7,
+                         help='Stage 2: minimum cluster softmax confidence required to use a pseudo-text pair')
+    parser.add_argument('--pseudo_refresh_epochs', type=int, default=0,
+                         help='Stage 2: reload --pseudo_names_path every N epochs (0 = load once, never refresh)')
+    parser.add_argument('--debug', action='store_true', default=False,
+                         help='print an image->text similarity sanity check for a few labeled samples')
+
     parser.add_argument('--hyper_start_epoch', default=0, type=int)
     parser.add_argument('--hyper_end_epoch', default=200, type=int)
 
@@ -629,6 +731,8 @@ if __name__ == "__main__":
     args.num_mlp_layers = 3
     args.mlp_out_dim = args.num_labeled_classes + args.num_unlabeled_classes
 
+    args.vit_clip = (args.model_name == 'vit_clip')
+
     if args.model_name == 'vit_dino':
         backbone = vits.__dict__['vit_base']()
 
@@ -638,6 +742,12 @@ if __name__ == "__main__":
         backbone = vits_v2.__dict__['vit_base']()
         state_dict = torch.load(dinov2_pretrain_path, map_location='cpu')
         backbone.load_state_dict(state_dict)
+    elif args.model_name == 'vit_clip':
+        # backbone: CLIPVisionWrapper (768-d pooled features by default, matching
+        # the DINO backbones' contract). args.clip_model is the full CLIPModel
+        # (vision + text) kept around so the frozen text encoder is usable below
+        # and in the training loop for image-text alignment.
+        backbone, args.clip_model = build_clip_backbone(args.clip_model_name)
     else:
         raise ValueError('Invalid model name')
     # backbone = torch.hub.load('facebookresearch/dino:main', 'dino_vitb16')
@@ -645,8 +755,8 @@ if __name__ == "__main__":
     if args.warmup_model_dir is not None:
         args.logger.info(f'Loading weights from {args.warmup_model_dir}')
         backbone.load_state_dict(torch.load(args.warmup_model_dir, map_location='cpu'))
-    
-    
+
+
 
     # ----------------------
     # HOW MUCH OF BASE MODEL TO FINETUNE
@@ -654,14 +764,23 @@ if __name__ == "__main__":
     for m in backbone.parameters():
         m.requires_grad = False
 
-    # Only finetune layers from block 'args.grad_from_block' onwards
-    for name, m in backbone.named_parameters():
-        if 'block' in name:
-            block_num = int(name.split('.')[1])
-            if block_num >= args.grad_from_block:
-                m.requires_grad = True
+    if args.vit_clip:
+        # CLIPVisionWrapper uses HF's naming ('vision_model.encoder.layers.N...')
+        # rather than DINO's ('blocks.N...'), so it needs its own block match.
+        for name, m in backbone.named_parameters():
+            if 'encoder.layers.' in name:
+                block_num = int(name.split('encoder.layers.')[1].split('.')[0])
+                if block_num >= args.grad_from_block:
+                    m.requires_grad = True
+    else:
+        # Only finetune layers from block 'args.grad_from_block' onwards
+        for name, m in backbone.named_parameters():
+            if 'block' in name:
+                block_num = int(name.split('.')[1])
+                if block_num >= args.grad_from_block:
+                    m.requires_grad = True
 
-    
+
     args.logger.info('model build')
 
     # --------------------
@@ -734,4 +853,41 @@ if __name__ == "__main__":
     args.num_species = args.num_labeled_classes + args.num_unlabeled_classes
     args.num_families = num_fine
     args.num_orders = num_superclass
+
+    # ----------------------
+    # CLIP TEXT ALIGNMENT SETUP (Stage 1 labeled, Stage 2 pseudo-text)
+    # Everything here is a no-op unless --model_name vit_clip and the
+    # corresponding weight arg is > 0.
+    # ----------------------
+    args.text_emb = None
+    args.known_id_lut = None
+    args.known_class_names = None
+    args.pseudo_proto = None
+    args.pseudo_valid = None
+
+    if args.vit_clip:
+        # Text encoder is frozen and never joins the optimizer: it is not part
+        # of `backbone` (see clip_backbone.CLIPVisionWrapper), so student.train()
+        # / get_params_groups(student.module.backbone) never touch it.
+        for p in args.clip_model.text_model.parameters():
+            p.requires_grad = False
+        for p in args.clip_model.text_projection.parameters():
+            p.requires_grad = False
+        args.clip_model.text_model.eval()
+        args.clip_model.text_projection.eval()
+
+        if args.align_weight > 0:
+            known_sorted = sorted(args.train_classes)
+            lut = torch.full((args.num_species,), -1, dtype=torch.long)
+            for local_idx, global_id in enumerate(known_sorted):
+                lut[global_id] = local_idx
+            args.known_id_lut = lut.to(device)
+
+            args.known_class_names = get_known_class_names(args)
+            args.text_emb = build_text_prototypes(args.clip_model, args.known_class_names, device)
+
+        if args.pseudo_align_weight > 0 and os.path.exists(args.pseudo_names_path):
+            args.pseudo_proto, args.pseudo_valid = load_pseudo_text_prototypes(
+                args.clip_model, args.pseudo_names_path, args.num_species, device)
+
     train(model, train_loader, test_loader, test_loader_unlabelled, args, get_order_family_target_dict[args.dataset_name], None)
