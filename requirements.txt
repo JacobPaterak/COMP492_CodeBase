@@ -1,5 +1,6 @@
 absl-py==2.1.0
 addict==2.4.0
+anthropic>=0.40.0
 bytecode==0.16.2
 cachetools==4.2.4
 certifi==2024.2.2

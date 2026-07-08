@@ -16,9 +16,11 @@ this script only wires up the plumbing around it.
 """
 
 import argparse
+import base64
 import json
 import os
 
+import anthropic
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -34,6 +36,58 @@ from aircraft_category import trees as aircraft_category_list
 from cars_category import trees as cars_category_list
 
 two_level_datasets = ['scars']
+
+_DATASET_DOMAIN = {'aircraft': 'aircraft', 'cub': 'bird species', 'scars': 'car'}
+_MEDIA_TYPES = {
+    '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+    '.webp': 'image/webp', '.gif': 'image/gif',
+}
+
+_claude_client = None
+
+
+def _get_claude_client():
+    global _claude_client
+    if _claude_client is None:
+        _claude_client = anthropic.Anthropic()
+    return _claude_client
+
+
+def call_vlm_naming_backend(exemplar_paths, dataset_name, model):
+    """Show exemplar_paths to Claude and ask for a coarse cluster name."""
+    client = _get_claude_client()
+    domain = _DATASET_DOMAIN.get(dataset_name, 'object')
+
+    content = []
+    for path in exemplar_paths:
+        with open(path, 'rb') as f:
+            data = base64.standard_b64encode(f.read()).decode('utf-8')
+        media_type = _MEDIA_TYPES.get(os.path.splitext(path)[1].lower(), 'image/jpeg')
+        content.append({
+            'type': 'image',
+            'source': {'type': 'base64', 'media_type': media_type, 'data': data},
+        })
+    content.append({
+        'type': 'text',
+        'text': (
+            f"These {len(exemplar_paths)} images are exemplars from one visual cluster of {domain}. "
+            "Give a short, COARSE manufacturer/family-level name for what they show "
+            "(e.g. 'Boeing 737' rather than '737-800'). "
+            "If the images do not clearly show a single consistent coarse category, "
+            "respond with exactly: UNSURE. "
+            "Respond with only the name (or UNSURE) and nothing else."
+        ),
+    })
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=32,
+        messages=[{'role': 'user', 'content': content}],
+    )
+    name = next((b.text for b in response.content if b.type == 'text'), '').strip()
+    if not name or name.upper() == 'UNSURE':
+        return ''
+    return name
 
 
 def build_model(args):
@@ -95,6 +149,8 @@ def main():
     parser.add_argument('--model_path', type=str, required=True, help='path to a saved SEAL checkpoint (vit_clip)')
     parser.add_argument('--output', type=str, default='pseudo_names.json')
     parser.add_argument('--exemplars_k', type=int, default=8)
+    parser.add_argument('--naming_model', type=str, default='claude-opus-4-8',
+                         help='Claude model used for cluster naming, e.g. claude-haiku-4-5 for a cheaper run')
     args = parser.parse_args()
 
     args = get_class_splits(args)
@@ -114,38 +170,41 @@ def main():
 
     exemplars = select_cluster_exemplars(features, cluster_ids, k=args.exemplars_k)
 
+    # Resume support: skip clusters that already have a non-blank name from a
+    # prior (possibly interrupted) run, so reruns don't re-spend on API calls.
     pseudo_names = {}
+    if os.path.exists(args.output):
+        with open(args.output, 'r') as f:
+            pseudo_names = json.load(f)
+        print(f'Loaded {len(pseudo_names)} existing entries from {args.output}; '
+              f'already-named clusters will be skipped.')
+
     for cluster_id in range(num_clusters):
+        cid_str = str(cluster_id)
+        if pseudo_names.get(cid_str):
+            print(f'cluster {cluster_id}: already named {pseudo_names[cid_str]!r}, skipping')
+            continue
+
         if cluster_id not in exemplars:
             # No unlabeled samples were assigned to this cluster (e.g. still
             # empty early in training) -- leave it unnamed.
-            pseudo_names[str(cluster_id)] = ""
+            pseudo_names[cid_str] = ""
             continue
 
         exemplar_local_idxs = exemplars[cluster_id]
         exemplar_uq_idxs = uq_idxs[exemplar_local_idxs].tolist()
         exemplar_paths = [unlabelled_train_examples_test.samples[i][0] for i in exemplar_local_idxs]
 
-        # ------------------------------------------------------------
-        # TODO(you): call your VLM/LLM naming backend here.
-        #   - Show it exemplar_paths (k images nearest this cluster's centroid)
-        #   - Ask for a COARSE manufacturer/family-level name (not a fine
-        #     variant guess -- e.g. "Boeing 737" rather than "737-800"),
-        #     since this is cluster-then-name on unlabeled/novel clusters,
-        #     not zero-shot CLIP classification.
-        #   - Leave the name "" (blank) if the VLM isn't confident; blank/
-        #     missing names are treated as unnamed (valid=False) by
-        #     text_align.load_pseudo_text_prototypes.
-        #
-        # name = call_vlm_naming_backend(exemplar_paths)
-        # ------------------------------------------------------------
-        name = ""
+        name = call_vlm_naming_backend(exemplar_paths, args.dataset_name, args.naming_model)
 
-        pseudo_names[str(cluster_id)] = name
+        pseudo_names[cid_str] = name
         print(f'cluster {cluster_id}: {len(exemplar_paths)} exemplars (uq_idxs={exemplar_uq_idxs}) -> name={name!r}')
 
-    with open(args.output, 'w') as f:
-        json.dump(pseudo_names, f, indent=2)
+        # Write after every cluster so a crash/interrupt loses at most one
+        # in-flight call, not the whole run.
+        with open(args.output, 'w') as f:
+            json.dump(pseudo_names, f, indent=2)
+
     print(f'Wrote {len(pseudo_names)} cluster entries to {args.output}')
 
 
